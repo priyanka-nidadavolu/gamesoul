@@ -1,8 +1,8 @@
 """
 extraction/emotion_extractor.py
 --------------------------------
-Converts any input (text, game reviews, descriptions) into a 9-dimensional
-emotional vector using an LLM backend (Ollama local or OpenAI).
+Converts any input into a 9-dimensional emotional vector.
+Cloud version: OpenAI primary, Ollama optional local fallback.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Optional
 
 import httpx
@@ -21,59 +21,37 @@ logger = logging.getLogger(__name__)
 DIMENSIONS = ["pace", "tension", "agency", "warmth", "scale", "beauty", "dread", "wonder", "rivalry"]
 
 DIMENSION_GUIDE = """
-- pace     (0=slow/meditative, 10=frantic/twitch): How fast the game demands you respond and move
-- tension  (0=relaxed/carefree, 10=high-stakes/stressful): How much every decision feels like it matters right now
-- agency   (0=passive/on-rails, 10=full player control): How much the outcome depends on your choices
-- warmth   (0=cold/clinical/hostile, 10=emotionally safe/nurturing/human): Whether the game feels welcoming
-- scale    (0=intimate/small, 10=vast/epic/cosmic): The felt size of the world and your place in it
-- beauty   (0=purely functional, 10=artistic/aesthetic): How much visual or sonic artistry is part of the experience
-- dread    (0=none, 10=pervasive fear/unease): Fear, unease, the feeling that something is wrong
-- wonder   (0=predictable, 10=revelatory/mind-expanding): Surprise, discovery, the feeling of a world larger than you expected
-- rivalry  (0=solo/cooperative, 10=purely competitive against humans): How much the thrill comes from competing
+- pace     (0=slow/meditative, 10=frantic/twitch)
+- tension  (0=relaxed/carefree, 10=high-stakes/stressful)
+- agency   (0=passive/on-rails, 10=full player control)
+- warmth   (0=cold/clinical/hostile, 10=emotionally safe/nurturing)
+- scale    (0=intimate/small, 10=vast/epic/cosmic)
+- beauty   (0=purely functional, 10=artistic/aesthetic)
+- dread    (0=none, 10=pervasive fear/unease)
+- wonder   (0=predictable, 10=revelatory/mind-expanding)
+- rivalry  (0=solo/cooperative, 10=purely competitive vs humans)
 """
 
-EXTRACTION_SYSTEM_PROMPT = f"""You are an expert game psychologist and emotion analyst.
-Your task is to extract emotional dimension scores from text about a video game.
-Score each dimension 0-10 (decimals allowed) based on the emotional experience, NOT game mechanics.
+EXTRACTION_SYSTEM = f"""You are an expert game psychologist.
+Extract emotional dimension scores from text about a video game.
+Score each 0-10 based on the emotional EXPERIENCE, not mechanics.
 
-Dimensions:
-{DIMENSION_GUIDE}
+Dimensions:{DIMENSION_GUIDE}
 
-ALWAYS respond with valid JSON only. No preamble, no explanation outside the JSON.
-Format:
+Respond ONLY with valid JSON, no preamble:
 {{
-  "pace": <float 0-10>,
-  "tension": <float 0-10>,
-  "agency": <float 0-10>,
-  "warmth": <float 0-10>,
-  "scale": <float 0-10>,
-  "beauty": <float 0-10>,
-  "dread": <float 0-10>,
-  "wonder": <float 0-10>,
-  "rivalry": <float 0-10>,
-  "confidence": <float 0-1>,
-  "justifications": {{
-    "pace": "<one sentence>",
-    "tension": "<one sentence>",
-    "agency": "<one sentence>",
-    "warmth": "<one sentence>",
-    "scale": "<one sentence>",
-    "beauty": "<one sentence>",
-    "dread": "<one sentence>",
-    "wonder": "<one sentence>",
-    "rivalry": "<one sentence>"
-  }}
+  "pace": float, "tension": float, "agency": float, "warmth": float,
+  "scale": float, "beauty": float, "dread": float, "wonder": float,
+  "rivalry": float, "confidence": float (0-1),
+  "justifications": {{"pace": "one sentence", ...}}
 }}"""
 
-USER_INPUT_SYSTEM_PROMPT = f"""You are an emotion interpreter for a game discovery app.
-A user has described how they want to FEEL while playing a game.
-Your job is to translate their description into a 9-dimensional emotional target vector.
+USER_INPUT_SYSTEM = f"""You are an emotion interpreter for a game discovery app.
+Translate a user's desired feeling into a 9-dimensional target vector.
 
-Dimensions:
-{DIMENSION_GUIDE}
+Dimensions:{DIMENSION_GUIDE}
 
-Score dimensions based on what the user WANTS to feel. If they don't mention a dimension, infer a neutral default.
-ALWAYS respond with valid JSON only. Same format as above."""
+Respond ONLY with valid JSON, same format as above."""
 
 
 @dataclass
@@ -102,72 +80,54 @@ class EmotionVector:
 
     @classmethod
     def midpoint(cls) -> "EmotionVector":
-        """Neutral/unknown default."""
         return cls()
 
     def contrast(self, other: "EmotionVector") -> "EmotionVector":
-        """Compute a target vector from a loved game minus a hated game."""
         result = {}
         for d in DIMENSIONS:
-            loved = getattr(self, d)
-            hated = getattr(other, d)
-            # Target: push toward loved, away from hated
-            delta = loved - hated
-            target = max(0.0, min(10.0, 5.0 + delta * 0.8))
-            result[d] = target
+            delta = getattr(self, d) - getattr(other, d)
+            result[d] = max(0.0, min(10.0, 5.0 + delta * 0.8))
         result["confidence"] = min(self.confidence, other.confidence)
         return EmotionVector(**result)
 
 
 class EmotionExtractor:
     """
-    Extracts 9-dimensional emotion vectors using an LLM.
-    Falls back gracefully: OpenAI → Ollama → heuristic defaults.
+    OpenAI-primary extractor with optional Ollama fallback.
+    Set OPENAI_API_KEY env var to enable.
     """
 
     def __init__(
         self,
-        ollama_host: str = None,
         openai_api_key: str = None,
-        model_local: str = "llama3",
-        model_openai: str = "gpt-4o",
+        ollama_host: str = None,
+        model_openai: str = "gpt-4o-mini",   # cheap + fast
+        model_local: str = "tinyllama",
         timeout: int = 30,
     ):
-        self.ollama_host = ollama_host or os.getenv("OLLAMA_HOST", "http://localhost:11434")
         self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY", "")
-        self.model_local = model_local
+        self.ollama_host = ollama_host or os.getenv("OLLAMA_HOST", "http://localhost:11434")
         self.model_openai = model_openai
+        self.model_local = model_local
         self.timeout = timeout
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def from_reviews(self, reviews_text: str, game_name: str = "") -> EmotionVector:
-        """Extract emotion vector from aggregated Steam reviews."""
-        prompt = f"Game: {game_name}\n\nPlayer reviews (aggregated):\n{reviews_text[:4000]}"
-        return self._extract(prompt, system=EXTRACTION_SYSTEM_PROMPT)
+        prompt = f"Game: {game_name}\n\nPlayer reviews:\n{reviews_text[:4000]}"
+        return self._extract(prompt, system=EXTRACTION_SYSTEM)
 
     def from_description(self, description: str, game_name: str = "") -> EmotionVector:
-        """Extract from developer description and metadata."""
-        prompt = f"Game: {game_name}\n\nGame description:\n{description[:3000]}"
-        return self._extract(prompt, system=EXTRACTION_SYSTEM_PROMPT)
+        prompt = f"Game: {game_name}\n\nDescription:\n{description[:3000]}"
+        return self._extract(prompt, system=EXTRACTION_SYSTEM)
 
     def from_user_text(self, user_input: str) -> EmotionVector:
-        """Convert free-text user feeling description to a target vector."""
-        return self._extract(user_input, system=USER_INPUT_SYSTEM_PROMPT)
+        return self._extract(user_input, system=USER_INPUT_SYSTEM)
 
-    def from_anchor_games(
-        self, loved_vector: EmotionVector, hated_vector: EmotionVector
-    ) -> EmotionVector:
-        """Derive target from loved/hated game contrast."""
-        return loved_vector.contrast(hated_vector)
+    def from_anchor_games(self, loved: EmotionVector, hated: EmotionVector) -> EmotionVector:
+        return loved.contrast(hated)
 
-    def merge_weighted(
-        self,
-        vectors: list[EmotionVector],
-        weights: list[float],
-    ) -> EmotionVector:
-        """Weighted average of multiple vectors (e.g. reviews + description + metadata)."""
-        assert len(vectors) == len(weights), "vectors and weights must match"
+    def merge_weighted(self, vectors: list[EmotionVector], weights: list[float]) -> EmotionVector:
         total_w = sum(weights)
         result = {d: 0.0 for d in DIMENSIONS}
         for vec, w in zip(vectors, weights):
@@ -179,17 +139,15 @@ class EmotionExtractor:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _extract(self, user_message: str, system: str) -> EmotionVector:
-        """Try OpenAI first, fall back to Ollama."""
         if self.openai_api_key:
             try:
                 return self._call_openai(user_message, system)
             except Exception as e:
-                logger.warning(f"OpenAI failed ({e}), falling back to Ollama")
-
+                logger.warning(f"OpenAI failed ({e}), trying Ollama")
         try:
             return self._call_ollama(user_message, system)
         except Exception as e:
-            logger.error(f"Ollama failed ({e}), returning default vector")
+            logger.error(f"All LLMs failed ({e}), returning default vector")
             return EmotionVector(confidence=0.0)
 
     def _call_openai(self, user_message: str, system: str) -> EmotionVector:
@@ -209,7 +167,7 @@ class EmotionExtractor:
             )
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]
-            return self._parse_response(content)
+            return self._parse(content)
 
     def _call_ollama(self, user_message: str, system: str) -> EmotionVector:
         with httpx.Client(timeout=self.timeout) as client:
@@ -227,27 +185,17 @@ class EmotionExtractor:
             )
             resp.raise_for_status()
             content = resp.json()["message"]["content"]
-            return self._parse_response(content)
+            return self._parse(content)
 
-    def _parse_response(self, content: str) -> EmotionVector:
-        """Parse LLM JSON response into EmotionVector."""
-        # Strip markdown code blocks if present
+    def _parse(self, content: str) -> EmotionVector:
         content = re.sub(r"```(?:json)?", "", content).strip()
         try:
             data = json.loads(content)
             return EmotionVector(
-                pace=float(data.get("pace", 5)),
-                tension=float(data.get("tension", 5)),
-                agency=float(data.get("agency", 5)),
-                warmth=float(data.get("warmth", 5)),
-                scale=float(data.get("scale", 5)),
-                beauty=float(data.get("beauty", 5)),
-                dread=float(data.get("dread", 0)),
-                wonder=float(data.get("wonder", 5)),
-                rivalry=float(data.get("rivalry", 5)),
+                **{d: float(data.get(d, 5)) for d in DIMENSIONS},
                 confidence=float(data.get("confidence", 0.7)),
                 justifications=data.get("justifications", {}),
             )
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            logger.error(f"Failed to parse LLM response: {e}\nContent: {content[:500]}")
+        except Exception as e:
+            logger.error(f"Parse failed: {e} | content: {content[:200]}")
             return EmotionVector(confidence=0.1)

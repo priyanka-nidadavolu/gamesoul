@@ -5,11 +5,13 @@ WORKDIR /app
 COPY api/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy shared modules from project root
+# Shared modules
 COPY extraction/emotion_extractor.py .
+COPY extraction/index_games.py .
 COPY bandit/bandit.py bandit.py
+COPY data/ingest.py ingest.py
 
-# Copy API source
+# API source
 COPY api/ .
 
 EXPOSE 8000

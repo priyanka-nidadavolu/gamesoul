@@ -1,108 +1,313 @@
 """
 api/main.py
 -----------
-FastAPI gateway for GameSoul. Handles the four input modes,
-calls the emotion engine, queries Qdrant, applies the bandit,
-and returns ranked recommendations.
+GameSoul FastAPI — cloud version.
+- Kafka replaced with PostgreSQL event queue
+- Airflow replaced with APScheduler (runs in-process)
+- OpenAI replaces Ollama
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
 
 import asyncpg
-from fastapi import FastAPI, HTTPException, Depends
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition
 
 from emotion_extractor import EmotionExtractor, EmotionVector, DIMENSIONS
 from bandit import ThompsonBandit
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # ── Config ─────────────────────────────────────────────────────────────────
-
 DB_URL = os.getenv("DATABASE_URL", "postgresql://gamesoul:gamesoul@localhost:5432/gamesoul")
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+QDRANT_URL = os.getenv("QDRANT_URL", "")       # optional — falls back to DB search if empty
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 COLLECTION = "game_emotions"
-TOP_K_RETRIEVE = 20  # retrieve 20, bandit selects 5
+TOP_K = 20
 
-# ── Lifespan (startup/shutdown) ─────────────────────────────────────────────
+# ── Scheduler jobs ──────────────────────────────────────────────────────────
+
+async def job_embed_new_games(db):
+    """Process pending game.releases events and extract emotions."""
+    rows = await db.fetch(
+        """SELECT id, payload FROM event_queue
+           WHERE topic='game.releases' AND status='pending'
+           ORDER BY created_at LIMIT 50
+           FOR UPDATE SKIP LOCKED"""
+    )
+    if not rows:
+        return
+
+    extractor = EmotionExtractor()
+    for row in rows:
+        event_id = row["id"]
+        payload = row["payload"]
+        game_id = payload.get("game_id")
+        try:
+            game = await db.fetchrow(
+                "SELECT id, name, description FROM games WHERE id=$1", game_id
+            )
+            if game:
+                vec = extractor.from_description(game["description"] or game["name"], game["name"])
+                dim_vals = {f"dim_{d}": getattr(vec, d) for d in DIMENSIONS}
+                set_clause = ", ".join(f"{k}=${i+2}" for i, k in enumerate(dim_vals))
+                vals = list(dim_vals.values()) + [vec.confidence, game_id]
+                await db.execute(
+                    f"UPDATE games SET {set_clause}, extraction_confidence=${len(dim_vals)+2} WHERE id=${len(dim_vals)+3}",
+                    *vals,
+                )
+                # If Qdrant configured, upsert vector
+                if QDRANT_URL:
+                    await _upsert_qdrant(game_id, vec.to_list(), game["name"])
+
+            await db.execute(
+                "UPDATE event_queue SET status='done', processed_at=NOW() WHERE id=$1", event_id
+            )
+        except Exception as e:
+            logger.error(f"embed_new_games failed for game {game_id}: {e}")
+            await db.execute(
+                "UPDATE event_queue SET status='failed', attempts=attempts+1 WHERE id=$1", event_id
+            )
+
+    logger.info(f"Embedded {len(rows)} new games")
+
+
+async def job_data_quality(db):
+    """Flag low-confidence games for review."""
+    count = await db.fetchval(
+        """UPDATE games SET needs_review=TRUE
+           WHERE extraction_confidence < 0.5 AND extraction_confidence IS NOT NULL
+             AND needs_review=FALSE
+           RETURNING COUNT(*)"""
+    )
+    logger.info(f"Data quality: flagged {count or 0} games for review")
+    await _record_job(db, "data_quality_check", "success")
+
+
+async def job_bandit_retrain(db):
+    """Reload bandit from last 30 days of ratings."""
+    rows = await db.fetch(
+        """SELECT rec.input_mode,
+                  COUNT(r.id) AS pulls,
+                  SUM(CASE WHEN r.rating >= 4 OR r.thumbs_up THEN 1 ELSE 0 END) AS rewards
+           FROM ratings r
+           JOIN recommendations rec ON rec.id = r.recommendation_id
+           WHERE r.created_at > NOW() - INTERVAL '30 days'
+           GROUP BY rec.input_mode"""
+    )
+    for row in rows:
+        alpha = float(row["rewards"] or 0) + 1
+        beta = float(row["pulls"] - (row["rewards"] or 0)) + 1
+        await db.execute(
+            """INSERT INTO bandit_arms (arm_name, user_segment, alpha, beta, total_pulls, total_rewards)
+               VALUES ($1, 'global', $2, $3, $4, $5)
+               ON CONFLICT (arm_name, user_segment) DO UPDATE
+               SET alpha=$2, beta=$3, total_pulls=$4, total_rewards=$5, updated_at=NOW()""",
+            row["input_mode"], alpha, beta, int(row["pulls"]), float(row["rewards"] or 0),
+        )
+    logger.info(f"Bandit retrained on {len(rows)} arms")
+    await _record_job(db, "bandit_retrain", "success")
+
+
+async def _record_job(db, job_name: str, status: str):
+    await db.execute(
+        "UPDATE scheduled_jobs SET last_run_at=NOW(), last_status=$1 WHERE job_name=$2",
+        status, job_name,
+    )
+
+
+async def _upsert_qdrant(game_id: int, vector: list[float], name: str):
+    import httpx
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.put(
+            f"{QDRANT_URL}/collections/{COLLECTION}/points",
+            json={"points": [{"id": game_id, "vector": vector, "payload": {"game_id": game_id, "name": name}}]},
+        )
+
+
+# ── Lifespan ────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     app.state.db = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
-    app.state.qdrant = AsyncQdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-    app.state.extractor = EmotionExtractor()
+    app.state.extractor = EmotionExtractor(openai_api_key=OPENAI_API_KEY)
     app.state.bandit = ThompsonBandit()
-    # Ensure Qdrant collection exists
-    await ensure_collection(app.state.qdrant)
+
+    # Load bandit state from DB
+    rows = await app.state.db.fetch(
+        "SELECT arm_name, user_segment, alpha, beta FROM bandit_arms"
+    )
+    app.state.bandit.load_from_db_rows([dict(r) for r in rows])
+
+    # Start background scheduler
+    scheduler = AsyncIOScheduler()
+    db = app.state.db
+    scheduler.add_job(lambda: job_embed_new_games(db), "cron", hour=2)
+    scheduler.add_job(lambda: job_data_quality(db),    "cron", hour=4)
+    scheduler.add_job(lambda: job_bandit_retrain(db),  "cron", day=1, hour=3)
+    scheduler.start()
+    app.state.scheduler = scheduler
+
     logger.info("GameSoul API started")
     yield
-    # Shutdown
+
+    scheduler.shutdown()
     await app.state.db.close()
-    await app.state.qdrant.close()
 
 
-app = FastAPI(
-    title="GameSoul API",
-    description="Emotion-driven game discovery",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="GameSoul API", version="2.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
-async def ensure_collection(qdrant: AsyncQdrantClient):
-    collections = await qdrant.get_collections()
-    names = [c.name for c in collections.collections]
-    if COLLECTION not in names:
-        await qdrant.create_collection(
-            collection_name=COLLECTION,
-            vectors_config=VectorParams(size=9, distance=Distance.COSINE),
+# ── DB-based vector search (fallback when Qdrant not configured) ────────────
+
+async def db_search(db, query_vector: list[float], limit: int = TOP_K) -> list[tuple[int, float]]:
+    """
+    Cosine similarity in pure SQL using the stored dim_* columns.
+    Not as fast as Qdrant but works with zero extra infra.
+    """
+    dims = DIMENSIONS
+    # Build dot product and magnitude expressions
+    dot = " + ".join(f"COALESCE(dim_{d}, 5) * {query_vector[i]}" for i, d in enumerate(dims))
+    mag_db = "SQRT(" + " + ".join(f"POWER(COALESCE(dim_{d}, 5), 2)" for d in dims) + ")"
+    mag_q = sum(v**2 for v in query_vector) ** 0.5 or 1.0
+
+    sql = f"""
+        SELECT id,
+               ({dot}) / (NULLIF({mag_db}, 0) * {mag_q}) AS score
+        FROM games
+        WHERE extraction_confidence IS NOT NULL
+          AND extraction_confidence > 0
+        ORDER BY score DESC
+        LIMIT {limit}
+    """
+    rows = await db.fetch(sql)
+    return [(row["id"], float(row["score"])) for row in rows]
+
+
+async def qdrant_search(query_vector: list[float], limit: int = TOP_K) -> list[tuple[int, float]]:
+    import httpx
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(
+            f"{QDRANT_URL}/collections/{COLLECTION}/points/search",
+            json={"vector": query_vector, "limit": limit, "with_payload": True},
         )
-        logger.info(f"Created Qdrant collection '{COLLECTION}'")
+        resp.raise_for_status()
+        results = resp.json()["result"]
+        return [(r["payload"]["game_id"], r["score"]) for r in results]
 
 
-# ── Request / Response Models ───────────────────────────────────────────────
+async def search_games(db, query_vector: list[float]) -> list[tuple[int, float]]:
+    if QDRANT_URL:
+        try:
+            return await qdrant_search(query_vector)
+        except Exception as e:
+            logger.warning(f"Qdrant failed ({e}), falling back to DB search")
+    return await db_search(db, query_vector)
 
-class TextInputRequest(BaseModel):
-    text: str = Field(..., description="Free text describing desired emotional state")
+
+# ── Event queue helpers (replaces Kafka) ────────────────────────────────────
+
+async def publish(db, topic: str, payload: dict):
+    await db.execute(
+        "INSERT INTO event_queue (topic, payload) VALUES ($1, $2)",
+        topic, json.dumps(payload),
+    )
+
+
+# ── Shared recommendation logic ─────────────────────────────────────────────
+
+async def recommend(query_vec: EmotionVector, input_mode: str, session_id: str, request: Request):
+    db = request.app.state.db
+    bandit = request.app.state.bandit
+    vec_list = query_vec.to_list()
+
+    candidates = await search_games(db, vec_list)
+    if not candidates:
+        raise HTTPException(404, "No games indexed yet. Run the indexing script first.")
+
+    game_ids = [gid for gid, _ in candidates]
+    scores = dict(candidates)
+
+    rows = await db.fetch(
+        "SELECT id, name, cover_url, " + ", ".join(f"dim_{d}" for d in DIMENSIONS) +
+        " FROM games WHERE id = ANY($1::int[])", game_ids
+    )
+    games_map = {row["id"]: dict(row) for row in rows}
+
+    selected = bandit.select(candidates, k=5, segment="global")
+
+    recs = []
+    for gid in selected:
+        g = games_map.get(gid)
+        if not g:
+            continue
+        game_vec = {d: g.get(f"dim_{d}") or 5.0 for d in DIMENSIONS}
+        matches = [d for d in DIMENSIONS if abs(query_vec.to_dict()[d] - game_vec[d]) < 2.0 and query_vec.to_dict()[d] > 6]
+        explanation = f"Matches your desire for {' and '.join(matches[:2])}." if matches else "Closely mirrors your emotional target."
+        recs.append({
+            "game_id": gid, "name": g["name"],
+            "similarity_score": round(scores[gid], 3),
+            "explanation": explanation,
+            "cover_url": g.get("cover_url"),
+            "emotion_vector": game_vec,
+        })
+
+    # Persist
+    sid = uuid.UUID(session_id)
+    exists = await db.fetchrow("SELECT 1 FROM user_sessions WHERE session_id=$1", sid)
+    if not exists:
+        await db.execute(
+            "INSERT INTO user_sessions (session_id, input_mode) VALUES ($1, $2)", sid, input_mode
+        )
+    rec_id = await db.fetchval(
+        """INSERT INTO recommendations (session_id, query_vector, input_mode, game_ids, similarity_scores)
+           VALUES ($1, $2, $3, $4, $5) RETURNING id""",
+        sid, vec_list, input_mode,
+        [r["game_id"] for r in recs], [r["similarity_score"] for r in recs],
+    )
+
+    # Publish session event to queue
+    await publish(db, "user.sessions", {"session_id": session_id, "input_mode": input_mode})
+
+    return {
+        "session_id": session_id,
+        "recommendation_id": rec_id,
+        "query_vector": query_vec.to_dict(),
+        "recommendations": recs,
+        "input_mode": input_mode,
+    }
+
+
+# ── Request models ──────────────────────────────────────────────────────────
+
+class TextRequest(BaseModel):
+    text: str
     session_id: Optional[str] = None
-    use_openai: bool = False
 
-
-class AnchorInputRequest(BaseModel):
-    loved_game_id: int = Field(..., description="ID of a game the user loved")
-    hated_game_id: int = Field(..., description="ID of a game the user disliked")
+class VisualRequest(BaseModel):
+    selected_image_ids: list[str]
     session_id: Optional[str] = None
 
-
-class VisualInputRequest(BaseModel):
-    """Visual mood picker: image tags map to emotion dimension weights."""
-    selected_image_ids: list[str] = Field(..., description="IDs of selected mood images")
+class SoundRequest(BaseModel):
+    selected_clip_ids: list[str]
     session_id: Optional[str] = None
 
-
-class SoundInputRequest(BaseModel):
-    """Sound check: selected audio clips map to emotion vectors."""
-    selected_clip_ids: list[str] = Field(..., description="IDs of selected audio clips")
+class AnchorRequest(BaseModel):
+    loved_game_id: int
+    hated_game_id: int
     session_id: Optional[str] = None
-
 
 class RatingRequest(BaseModel):
     session_id: str
@@ -112,336 +317,135 @@ class RatingRequest(BaseModel):
     thumbs_up: Optional[bool] = None
 
 
-class GameRecommendation(BaseModel):
-    game_id: int
-    name: str
-    similarity_score: float
-    explanation: str
-    cover_url: Optional[str]
-    emotion_vector: dict
+# ── Endpoints ───────────────────────────────────────────────────────────────
 
-
-class RecommendationResponse(BaseModel):
-    session_id: str
-    recommendation_id: int
-    query_vector: dict
-    recommendations: list[GameRecommendation]
-    input_mode: str
-
-
-# ── Dependency Injection ────────────────────────────────────────────────────
-
-def get_db(request):
-    return request.app.state.db
-
-def get_qdrant(request):
-    return request.app.state.qdrant
-
-def get_extractor(request):
-    return request.app.state.extractor
-
-def get_bandit(request):
-    return request.app.state.bandit
-
-
-# ── Core Recommendation Logic ───────────────────────────────────────────────
-
-async def recommend(
-    query_vector: EmotionVector,
-    input_mode: str,
-    db,
-    qdrant: AsyncQdrantClient,
-    bandit: ThompsonBandit,
-    session_id: str,
-    use_popularity: bool = False,
-) -> RecommendationResponse:
-    """Core recommendation: vector search → bandit selection → persist."""
-    vec_list = query_vector.to_list()
-
-    # 1. Qdrant nearest-neighbor search
-    results = await qdrant.search(
-        collection_name=COLLECTION,
-        query_vector=vec_list,
-        limit=TOP_K_RETRIEVE,
-        with_payload=True,
-    )
-
-    if not results:
-        raise HTTPException(status_code=404, detail="No games indexed yet")
-
-    # 2. Fetch game details from PostgreSQL
-    game_ids = [r.payload["game_id"] for r in results]
-    scores = {r.payload["game_id"]: r.score for r in results}
-
-    games_rows = await db.fetch(
-        "SELECT id, name, cover_url, dim_pace, dim_tension, dim_agency, dim_warmth, "
-        "dim_scale, dim_beauty, dim_dread, dim_wonder, dim_rivalry "
-        "FROM games WHERE id = ANY($1::int[])",
-        game_ids,
-    )
-    games_map = {row["id"]: dict(row) for row in games_rows}
-
-    # 3. Optional popularity re-rank (Experiment 3)
-    candidates = []
-    for gid in game_ids:
-        if gid not in games_map:
-            continue
-        score = scores[gid]
-        if use_popularity:
-            pop_row = await db.fetchrow(
-                "SELECT rating FROM games WHERE id=$1", gid
-            )
-            pop_score = (pop_row["rating"] or 5.0) / 10.0
-            score = score * 0.9 + pop_score * 0.1
-        candidates.append((gid, score))
-
-    candidates.sort(key=lambda x: x[1], reverse=True)
-
-    # 4. Bandit selects top 5 from top 20
-    selected_ids = bandit.select(candidates[:TOP_K_RETRIEVE], k=5, segment="global")
-
-    # 5. Build recommendations with explanations
-    recommendations = []
-    for gid in selected_ids:
-        g = games_map.get(gid)
-        if not g:
-            continue
-        game_vec = {d: g.get(f"dim_{d}", 5.0) for d in DIMENSIONS}
-        explanation = _build_explanation(query_vector.to_dict(), game_vec, g["name"])
-        recommendations.append(
-            GameRecommendation(
-                game_id=gid,
-                name=g["name"],
-                similarity_score=round(scores[gid], 3),
-                explanation=explanation,
-                cover_url=g.get("cover_url"),
-                emotion_vector=game_vec,
-            )
-        )
-
-    # 6. Persist session, recommendation
-    async with db.transaction():
-        session_exists = await db.fetchrow(
-            "SELECT session_id FROM user_sessions WHERE session_id=$1",
-            uuid.UUID(session_id),
-        )
-        if not session_exists:
-            await db.execute(
-                "INSERT INTO user_sessions (session_id, input_mode) VALUES ($1, $2)",
-                uuid.UUID(session_id), input_mode,
-            )
-
-        rec_id = await db.fetchval(
-            """INSERT INTO recommendations
-               (session_id, query_vector, input_mode, game_ids, similarity_scores)
-               VALUES ($1, $2, $3, $4, $5)
-               RETURNING id""",
-            uuid.UUID(session_id),
-            vec_list,
-            input_mode,
-            [r.game_id for r in recommendations],
-            [r.similarity_score for r in recommendations],
-        )
-
-    return RecommendationResponse(
-        session_id=session_id,
-        recommendation_id=rec_id,
-        query_vector=query_vector.to_dict(),
-        recommendations=recommendations,
-        input_mode=input_mode,
-    )
-
-
-def _build_explanation(query: dict, game: dict, game_name: str) -> str:
-    """Generate a 1-line emotional match explanation."""
-    # Find the top 2 matching dimensions
-    matches = []
-    for d in DIMENSIONS:
-        q_val = query.get(d, 5)
-        g_val = game.get(d, 5)
-        if abs(q_val - g_val) < 2.0 and (q_val > 6 or q_val < 4):
-            matches.append(d)
-
-    dim_labels = {
-        "pace": "intense pace",
-        "tension": "high-stakes tension",
-        "agency": "player agency",
-        "warmth": "emotional warmth",
-        "scale": "epic scale",
-        "beauty": "artistic beauty",
-        "dread": "atmospheric dread",
-        "wonder": "sense of wonder",
-        "rivalry": "competitive rivalry",
-    }
-
-    if matches:
-        top = [dim_labels[m] for m in matches[:2]]
-        return f"Matches your desire for {' and '.join(top)}."
-    return f"Closely mirrors your emotional target across multiple dimensions."
-
-
-# ── Endpoints ──────────────────────────────────────────────────────────────
-
-@app.post("/recommend/text", response_model=RecommendationResponse)
-async def recommend_from_text(req: TextInputRequest, request=None):
-    """Input mode 1: Free text emotion description."""
-    from fastapi import Request
-    extractor: EmotionExtractor = request.app.state.extractor
-    db = request.app.state.db
-    qdrant = request.app.state.qdrant
-    bandit = request.app.state.bandit
-
-    # A/B: route to OpenAI or Ollama
-    if req.use_openai:
-        extractor.openai_api_key = os.getenv("OPENAI_API_KEY", "")
-    query_vec = extractor.from_user_text(req.text)
-    session_id = req.session_id or str(uuid.uuid4())
-    return await recommend(query_vec, "text", db, qdrant, bandit, session_id)
-
-
-@app.post("/recommend/anchor", response_model=RecommendationResponse)
-async def recommend_from_anchor(req: AnchorInputRequest, request=None):
-    """Input mode 4: Love it / hate it contrast."""
-    from fastapi import Request
-    db = request.app.state.db
-    qdrant = request.app.state.qdrant
-    bandit = request.app.state.bandit
-
-    # Load emotion vectors for both games
-    loved_row = await db.fetchrow(
-        "SELECT dim_pace, dim_tension, dim_agency, dim_warmth, dim_scale, "
-        "dim_beauty, dim_dread, dim_wonder, dim_rivalry FROM games WHERE id=$1",
-        req.loved_game_id,
-    )
-    hated_row = await db.fetchrow(
-        "SELECT dim_pace, dim_tension, dim_agency, dim_warmth, dim_scale, "
-        "dim_beauty, dim_dread, dim_wonder, dim_rivalry FROM games WHERE id=$1",
-        req.hated_game_id,
-    )
-
-    if not loved_row or not hated_row:
-        raise HTTPException(status_code=404, detail="Game not found")
-
-    loved_vec = EmotionVector(**{d: loved_row[f"dim_{d}"] or 5.0 for d in DIMENSIONS})
-    hated_vec = EmotionVector(**{d: hated_row[f"dim_{d}"] or 5.0 for d in DIMENSIONS})
-    query_vec = loved_vec.contrast(hated_vec)
-
-    session_id = req.session_id or str(uuid.uuid4())
-    return await recommend(query_vec, "anchor", db, qdrant, bandit, session_id)
-
-
-@app.post("/recommend/visual", response_model=RecommendationResponse)
-async def recommend_from_visual(req: VisualInputRequest, request=None):
-    """Input mode 2: Visual mood picker."""
-    # Visual image → emotion vector mapping
-    IMAGE_EMOTION_MAP = {
-        "rainy_window":    EmotionVector(pace=2, tension=2, warmth=3, wonder=6, dread=3, beauty=8, agency=5, scale=2, rivalry=0),
-        "crowded_market":  EmotionVector(pace=7, tension=5, warmth=6, wonder=5, dread=1, beauty=5, agency=6, scale=5, rivalry=4),
-        "lone_mountain":   EmotionVector(pace=2, tension=3, warmth=2, wonder=8, dread=2, beauty=9, agency=7, scale=9, rivalry=0),
-        "neon_city":       EmotionVector(pace=8, tension=6, warmth=2, wonder=6, dread=4, beauty=8, agency=7, scale=7, rivalry=5),
-        "forest_campfire": EmotionVector(pace=1, tension=1, warmth=9, wonder=5, dread=0, beauty=7, agency=5, scale=3, rivalry=0),
-        "storm_at_sea":    EmotionVector(pace=7, tension=8, warmth=1, wonder=7, dread=6, beauty=7, agency=6, scale=8, rivalry=2),
-        "empty_desert":    EmotionVector(pace=1, tension=3, warmth=1, wonder=7, dread=4, beauty=6, agency=8, scale=9, rivalry=0),
-        "arena_crowd":     EmotionVector(pace=9, tension=9, warmth=3, wonder=3, dread=2, beauty=4, agency=8, scale=5, rivalry=10),
-        "cozy_library":    EmotionVector(pace=1, tension=1, warmth=8, wonder=7, dread=0, beauty=8, agency=6, scale=2, rivalry=0),
-        "dark_corridor":   EmotionVector(pace=4, tension=7, warmth=1, wonder=4, dread=9, beauty=4, agency=6, scale=3, rivalry=0),
-    }
-
-    vecs = [IMAGE_EMOTION_MAP.get(img_id, EmotionVector()) for img_id in req.selected_image_ids]
-    if not vecs:
-        raise HTTPException(status_code=400, detail="No recognized image IDs")
-
-    weights = [1.0] * len(vecs)
+@app.post("/recommend/text")
+async def recommend_text(req: TextRequest, request: Request):
     extractor = request.app.state.extractor
-    query_vec = extractor.merge_weighted(vecs, weights)
-
-    session_id = req.session_id or str(uuid.uuid4())
-    return await recommend(
-        query_vec, "visual",
-        request.app.state.db, request.app.state.qdrant, request.app.state.bandit,
-        session_id,
-    )
+    vec = extractor.from_user_text(req.text)
+    return await recommend(vec, "text", req.session_id or str(uuid.uuid4()), request)
 
 
-@app.post("/recommend/sound", response_model=RecommendationResponse)
-async def recommend_from_sound(req: SoundInputRequest, request=None):
-    """Input mode 3: Sound check."""
-    SOUND_EMOTION_MAP = {
-        "rain_ambient":    EmotionVector(pace=1, tension=1, warmth=6, wonder=4, dread=1, beauty=7, agency=4, scale=2, rivalry=0),
-        "battle_drums":    EmotionVector(pace=9, tension=9, warmth=1, wonder=2, dread=5, beauty=3, agency=8, scale=6, rivalry=7),
-        "synthwave":       EmotionVector(pace=7, tension=5, warmth=3, wonder=6, dread=2, beauty=9, agency=7, scale=5, rivalry=3),
-        "nature_birds":    EmotionVector(pace=1, tension=1, warmth=8, wonder=7, dread=0, beauty=8, agency=5, scale=4, rivalry=0),
-        "deep_space_hum":  EmotionVector(pace=1, tension=3, warmth=1, wonder=9, dread=4, beauty=7, agency=5, scale=10, rivalry=0),
+@app.post("/recommend/visual")
+async def recommend_visual(req: VisualRequest, request: Request):
+    IMAGE_MAP = {
+        "rainy_window":    EmotionVector(pace=2,tension=2,warmth=3,wonder=6,dread=3,beauty=8,agency=5,scale=2,rivalry=0),
+        "crowded_market":  EmotionVector(pace=7,tension=5,warmth=6,wonder=5,dread=1,beauty=5,agency=6,scale=5,rivalry=4),
+        "lone_mountain":   EmotionVector(pace=2,tension=3,warmth=2,wonder=8,dread=2,beauty=9,agency=7,scale=9,rivalry=0),
+        "neon_city":       EmotionVector(pace=8,tension=6,warmth=2,wonder=6,dread=4,beauty=8,agency=7,scale=7,rivalry=5),
+        "forest_campfire": EmotionVector(pace=1,tension=1,warmth=9,wonder=5,dread=0,beauty=7,agency=5,scale=3,rivalry=0),
+        "storm_at_sea":    EmotionVector(pace=7,tension=8,warmth=1,wonder=7,dread=6,beauty=7,agency=6,scale=8,rivalry=2),
+        "empty_desert":    EmotionVector(pace=1,tension=3,warmth=1,wonder=7,dread=4,beauty=6,agency=8,scale=9,rivalry=0),
+        "arena_crowd":     EmotionVector(pace=9,tension=9,warmth=3,wonder=3,dread=2,beauty=4,agency=8,scale=5,rivalry=10),
+        "cozy_library":    EmotionVector(pace=1,tension=1,warmth=8,wonder=7,dread=0,beauty=8,agency=6,scale=2,rivalry=0),
+        "dark_corridor":   EmotionVector(pace=4,tension=7,warmth=1,wonder=4,dread=9,beauty=4,agency=6,scale=3,rivalry=0),
+        "deep_space":      EmotionVector(pace=1,tension=3,warmth=1,wonder=9,dread=4,beauty=7,agency=5,scale=10,rivalry=0),
+        "sunrise_peak":    EmotionVector(pace=3,tension=2,warmth=5,wonder=8,dread=0,beauty=9,agency=6,scale=7,rivalry=0),
     }
-
-    vecs = [SOUND_EMOTION_MAP.get(clip_id, EmotionVector()) for clip_id in req.selected_clip_ids]
+    vecs = [IMAGE_MAP[i] for i in req.selected_image_ids if i in IMAGE_MAP]
     if not vecs:
-        raise HTTPException(status_code=400, detail="No recognized clip IDs")
+        raise HTTPException(400, "No recognized image IDs")
+    vec = request.app.state.extractor.merge_weighted(vecs, [1.0]*len(vecs))
+    return await recommend(vec, "visual", req.session_id or str(uuid.uuid4()), request)
 
-    extractor = request.app.state.extractor
-    query_vec = extractor.merge_weighted(vecs, [1.0] * len(vecs))
-    session_id = req.session_id or str(uuid.uuid4())
-    return await recommend(
-        query_vec, "sound",
-        request.app.state.db, request.app.state.qdrant, request.app.state.bandit,
-        session_id,
-    )
+
+@app.post("/recommend/sound")
+async def recommend_sound(req: SoundRequest, request: Request):
+    SOUND_MAP = {
+        "rain_ambient":    EmotionVector(pace=1,tension=1,warmth=6,wonder=4,dread=1,beauty=7,agency=4,scale=2,rivalry=0),
+        "battle_drums":    EmotionVector(pace=9,tension=9,warmth=1,wonder=2,dread=5,beauty=3,agency=8,scale=6,rivalry=7),
+        "synthwave":       EmotionVector(pace=7,tension=5,warmth=3,wonder=6,dread=2,beauty=9,agency=7,scale=5,rivalry=3),
+        "nature_birds":    EmotionVector(pace=1,tension=1,warmth=8,wonder=7,dread=0,beauty=8,agency=5,scale=4,rivalry=0),
+        "deep_space_hum":  EmotionVector(pace=1,tension=3,warmth=1,wonder=9,dread=4,beauty=7,agency=5,scale=10,rivalry=0),
+    }
+    vecs = [SOUND_MAP[i] for i in req.selected_clip_ids if i in SOUND_MAP]
+    if not vecs:
+        raise HTTPException(400, "No recognized clip IDs")
+    vec = request.app.state.extractor.merge_weighted(vecs, [1.0]*len(vecs))
+    return await recommend(vec, "sound", req.session_id or str(uuid.uuid4()), request)
+
+
+@app.post("/recommend/anchor")
+async def recommend_anchor(req: AnchorRequest, request: Request):
+    db = request.app.state.db
+    cols = ", ".join(f"dim_{d}" for d in DIMENSIONS)
+    loved = await db.fetchrow(f"SELECT {cols} FROM games WHERE id=$1", req.loved_game_id)
+    hated = await db.fetchrow(f"SELECT {cols} FROM games WHERE id=$1", req.hated_game_id)
+    if not loved or not hated:
+        raise HTTPException(404, "Game not found")
+    loved_vec = EmotionVector(**{d: loved[f"dim_{d}"] or 5.0 for d in DIMENSIONS})
+    hated_vec = EmotionVector(**{d: hated[f"dim_{d}"] or 5.0 for d in DIMENSIONS})
+    vec = loved_vec.contrast(hated_vec)
+    return await recommend(vec, "anchor", req.session_id or str(uuid.uuid4()), request)
 
 
 @app.post("/rate")
-async def submit_rating(req: RatingRequest, request=None):
-    """Submit a rating for a recommendation."""
+async def rate(req: RatingRequest, request: Request):
     db = request.app.state.db
     bandit = request.app.state.bandit
-
     await db.execute(
-        """INSERT INTO ratings (session_id, recommendation_id, game_id, rating, thumbs_up)
-           VALUES ($1, $2, $3, $4, $5)""",
-        uuid.UUID(req.session_id), req.recommendation_id,
-        req.game_id, req.rating, req.thumbs_up,
+        "INSERT INTO ratings (session_id, recommendation_id, game_id, rating, thumbs_up) VALUES ($1,$2,$3,$4,$5)",
+        uuid.UUID(req.session_id), req.recommendation_id, req.game_id, req.rating, req.thumbs_up,
     )
-
-    # Update bandit in real-time
-    rec_row = await db.fetchrow(
-        "SELECT input_mode FROM recommendations WHERE id=$1", req.recommendation_id
-    )
-    if rec_row:
+    rec = await db.fetchrow("SELECT input_mode FROM recommendations WHERE id=$1", req.recommendation_id)
+    if rec:
         reward = 1.0 if req.thumbs_up or (req.rating and req.rating >= 4) else 0.0
-        bandit.update(arm=rec_row["input_mode"], reward=reward, segment="global")
-        # Persist bandit state
+        bandit.update(rec["input_mode"], reward)
         await db.execute(
-            """UPDATE bandit_arms
-               SET alpha = alpha + $1, beta = beta + $2,
-                   total_pulls = total_pulls + 1, total_rewards = total_rewards + $1,
-                   updated_at = NOW()
-               WHERE arm_name = $3 AND user_segment = 'global'""",
-            reward, 1.0 - reward, rec_row["input_mode"],
+            """UPDATE bandit_arms SET alpha=alpha+$1, beta=beta+$2,
+               total_pulls=total_pulls+1, updated_at=NOW()
+               WHERE arm_name=$3 AND user_segment='global'""",
+            reward, 1.0 - reward, rec["input_mode"],
         )
-
+        await publish(db, "user.feedback", {
+            "session_id": req.session_id, "game_id": req.game_id,
+            "rating": req.rating, "thumbs_up": req.thumbs_up, "input_mode": rec["input_mode"],
+        })
     return {"status": "ok"}
 
 
 @app.get("/games/search")
-async def search_games(q: str, limit: int = 10, request=None):
-    """Search games by name (for anchor input mode)."""
-    db = request.app.state.db
-    rows = await db.fetch(
-        "SELECT id, name, cover_url FROM games WHERE name ILIKE $1 LIMIT $2",
-        f"%{q}%", limit,
+async def search(q: str, limit: int = 10, request: Request = None):
+    rows = await request.app.state.db.fetch(
+        "SELECT id, name, cover_url FROM games WHERE name ILIKE $1 LIMIT $2", f"%{q}%", limit
     )
     return [dict(r) for r in rows]
 
 
-@app.get("/games/{game_id}")
-async def get_game(game_id: int, request=None):
-    """Get a single game with its emotion profile."""
-    db = request.app.state.db
-    row = await db.fetchrow("SELECT * FROM games WHERE id=$1", game_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Game not found")
-    return dict(row)
+@app.get("/admin/ingest")
+async def trigger_ingest(limit: int = 1000, request: Request = None):
+    """Manually trigger game ingestion (call after deploy to seed DB)."""
+    import asyncio
+    asyncio.create_task(_run_ingest(request.app.state.db, limit))
+    return {"status": "started", "limit": limit}
+
+
+async def _run_ingest(db, limit: int):
+    """Pull games from RAWG and extract emotions — runs in background."""
+    import httpx
+    from extraction.index_games import index_games
+    logger.info(f"Background ingest started: {limit} games")
+    # This calls the existing ingest + index pipeline
+    try:
+        import sys, os
+        sys.path.insert(0, "/app")
+        from ingest import fetch_rawg_games, upsert_games
+        import psycopg2
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        batch = []
+        for game in fetch_rawg_games(limit):
+            batch.append(game)
+            if len(batch) >= 100:
+                upsert_games(batch, conn)
+                batch = []
+        if batch:
+            upsert_games(batch, conn)
+        conn.close()
+        logger.info(f"Ingest complete: {limit} games")
+    except Exception as e:
+        logger.error(f"Ingest failed: {e}")
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "gamesoul-api"}
+    return {"status": "ok", "version": "2.0.0"}

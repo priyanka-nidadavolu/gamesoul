@@ -158,3 +158,39 @@ CREATE TABLE IF NOT EXISTS pipeline_events (
     details         JSONB,
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- ── Event Queue (replaces Kafka for cloud deployment) ─────────────────────
+-- Simple outbox pattern: producers INSERT, consumers SELECT FOR UPDATE SKIP LOCKED
+
+CREATE TABLE IF NOT EXISTS event_queue (
+    id              BIGSERIAL PRIMARY KEY,
+    topic           TEXT NOT NULL,       -- 'game.releases' | 'user.feedback' | 'pipeline.health'
+    payload         JSONB NOT NULL,
+    status          TEXT DEFAULT 'pending',  -- 'pending' | 'processing' | 'done' | 'failed'
+    attempts        INTEGER DEFAULT 0,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    processed_at    TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_queue_topic_status ON event_queue(topic, status);
+CREATE INDEX IF NOT EXISTS idx_event_queue_pending ON event_queue(created_at) WHERE status = 'pending';
+
+-- ── Scheduler jobs (replaces Airflow for cloud deployment) ────────────────
+
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+    id              SERIAL PRIMARY KEY,
+    job_name        TEXT UNIQUE NOT NULL,
+    schedule        TEXT NOT NULL,       -- cron expression
+    last_run_at     TIMESTAMPTZ,
+    next_run_at     TIMESTAMPTZ,
+    last_status     TEXT DEFAULT 'never_run',
+    last_error      TEXT,
+    enabled         BOOLEAN DEFAULT TRUE
+);
+
+INSERT INTO scheduled_jobs (job_name, schedule, next_run_at) VALUES
+    ('embed_new_games',    '0 2 * * *',   NOW()),
+    ('ab_evaluation',      '0 6 * * 1',   NOW()),
+    ('bandit_retrain',     '0 3 1 * *',   NOW()),
+    ('data_quality_check', '0 4 * * *',   NOW())
+ON CONFLICT DO NOTHING;

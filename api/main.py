@@ -40,6 +40,8 @@ TOP_K = 20
 
 async def job_embed_new_games(db):
     """Process pending game.releases events and extract emotions."""
+    if not db:
+        return
     rows = await db.fetch(
         """SELECT id, payload FROM event_queue
            WHERE topic='game.releases' AND status='pending'
@@ -85,6 +87,8 @@ async def job_embed_new_games(db):
 
 async def job_data_quality(db):
     """Flag low-confidence games for review."""
+    if not db:
+        return
     count = await db.fetchval(
         """UPDATE games SET needs_review=TRUE
            WHERE extraction_confidence < 0.5 AND extraction_confidence IS NOT NULL
@@ -97,6 +101,8 @@ async def job_data_quality(db):
 
 async def job_bandit_retrain(db):
     """Reload bandit from last 30 days of ratings."""
+    if not db:
+        return
     rows = await db.fetch(
         """SELECT rec.input_mode,
                   COUNT(r.id) AS pulls,
@@ -140,35 +146,38 @@ async def _upsert_qdrant(game_id: int, vector: list[float], name: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Extractor and bandit start immediately — no DB needed
+    import asyncio
+
     app.state.extractor = EmotionExtractor(openai_api_key=OPENAI_API_KEY)
     app.state.bandit = ThompsonBandit()
     app.state.db = None
     app.state.scheduler = None
 
-    # Try DB connection with retries — dont block startup if DB is slow
-    import asyncio
-    for attempt in range(5):
-        try:
-            app.state.db = await asyncpg.create_pool(DB_URL, min_size=1, max_size=10, timeout=10)
-            rows = await app.state.db.fetch(
-                "SELECT arm_name, user_segment, alpha, beta FROM bandit_arms"
-            )
-            app.state.bandit.load_from_db_rows([dict(r) for r in rows])
-            logger.info("DB connected")
-            break
-        except Exception as e:
-            logger.warning(f"DB connection attempt {attempt+1}/5 failed: {e}")
-            await asyncio.sleep(3)
+    async def _connect_db():
+        for attempt in range(5):
+            try:
+                pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=10, timeout=10)
+                rows = await pool.fetch(
+                    "SELECT arm_name, user_segment, alpha, beta FROM bandit_arms"
+                )
+                app.state.bandit.load_from_db_rows([dict(r) for r in rows])
+                app.state.db = pool
+                logger.info("DB connected")
+                return
+            except Exception as e:
+                logger.warning(f"DB connection attempt {attempt+1}/5 failed: {e}")
+                await asyncio.sleep(3)
 
-    # Start background scheduler
+    # Connect in background so /health responds immediately during startup
+    asyncio.create_task(_connect_db())
+
+    # Start scheduler — jobs reference app.state.db at runtime so they work
+    # even if DB connects after the scheduler starts
     try:
         scheduler = AsyncIOScheduler()
-        db = app.state.db
-        if db:
-            scheduler.add_job(lambda: job_embed_new_games(db), "cron", hour=2)
-            scheduler.add_job(lambda: job_data_quality(db),    "cron", hour=4)
-            scheduler.add_job(lambda: job_bandit_retrain(db),  "cron", day=1, hour=3)
+        scheduler.add_job(lambda: job_embed_new_games(app.state.db), "cron", hour=2)
+        scheduler.add_job(lambda: job_data_quality(app.state.db),    "cron", hour=4)
+        scheduler.add_job(lambda: job_bandit_retrain(app.state.db),  "cron", day=1, hour=3)
         scheduler.start()
         app.state.scheduler = scheduler
     except Exception as e:

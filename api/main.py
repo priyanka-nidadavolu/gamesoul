@@ -140,30 +140,47 @@ async def _upsert_qdrant(game_id: int, vector: list[float], name: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.db = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
+    # Extractor and bandit start immediately — no DB needed
     app.state.extractor = EmotionExtractor(openai_api_key=OPENAI_API_KEY)
     app.state.bandit = ThompsonBandit()
+    app.state.db = None
+    app.state.scheduler = None
 
-    # Load bandit state from DB
-    rows = await app.state.db.fetch(
-        "SELECT arm_name, user_segment, alpha, beta FROM bandit_arms"
-    )
-    app.state.bandit.load_from_db_rows([dict(r) for r in rows])
+    # Try DB connection with retries — dont block startup if DB is slow
+    import asyncio
+    for attempt in range(5):
+        try:
+            app.state.db = await asyncpg.create_pool(DB_URL, min_size=1, max_size=10, timeout=10)
+            rows = await app.state.db.fetch(
+                "SELECT arm_name, user_segment, alpha, beta FROM bandit_arms"
+            )
+            app.state.bandit.load_from_db_rows([dict(r) for r in rows])
+            logger.info("DB connected")
+            break
+        except Exception as e:
+            logger.warning(f"DB connection attempt {attempt+1}/5 failed: {e}")
+            await asyncio.sleep(3)
 
     # Start background scheduler
-    scheduler = AsyncIOScheduler()
-    db = app.state.db
-    scheduler.add_job(lambda: job_embed_new_games(db), "cron", hour=2)
-    scheduler.add_job(lambda: job_data_quality(db),    "cron", hour=4)
-    scheduler.add_job(lambda: job_bandit_retrain(db),  "cron", day=1, hour=3)
-    scheduler.start()
-    app.state.scheduler = scheduler
+    try:
+        scheduler = AsyncIOScheduler()
+        db = app.state.db
+        if db:
+            scheduler.add_job(lambda: job_embed_new_games(db), "cron", hour=2)
+            scheduler.add_job(lambda: job_data_quality(db),    "cron", hour=4)
+            scheduler.add_job(lambda: job_bandit_retrain(db),  "cron", day=1, hour=3)
+        scheduler.start()
+        app.state.scheduler = scheduler
+    except Exception as e:
+        logger.warning(f"Scheduler failed to start: {e}")
 
     logger.info("GameSoul API started")
     yield
 
-    scheduler.shutdown()
-    await app.state.db.close()
+    if app.state.scheduler:
+        app.state.scheduler.shutdown()
+    if app.state.db:
+        await app.state.db.close()
 
 
 app = FastAPI(title="GameSoul API", version="2.0.0", lifespan=lifespan)
@@ -230,6 +247,8 @@ async def publish(db, topic: str, payload: dict):
 
 async def recommend(query_vec: EmotionVector, input_mode: str, session_id: str, request: Request):
     db = request.app.state.db
+    if not db:
+        raise HTTPException(503, "Database not ready yet — please retry in a few seconds")
     bandit = request.app.state.bandit
     vec_list = query_vec.to_list()
 
@@ -448,4 +467,9 @@ async def _run_ingest(db, limit: int):
 
 @app.get("/health")
 async def health():
+    """Instant response — no DB call so Railway healthcheck never times out."""
     return {"status": "ok", "version": "2.0.0"}
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "GameSoul API"}

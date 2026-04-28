@@ -1,0 +1,15 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY api/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY extraction/emotion_extractor.py .
+COPY extraction/index_games.py .
+COPY bandit/bandit.py bandit.py
+COPY data/ingest.py ingest.py
+COPY api/ .
+
+EXPOSE 8000
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}

@@ -1,64 +1,46 @@
 # Deploying GameSoul to Railway
 
-## What changed from local version
-| Local | Cloud |
-|-------|-------|
-| Ollama (4GB LLM) | OpenAI gpt-4o-mini (~$0.01/1000 games) |
-| Kafka + Zookeeper | PostgreSQL event queue table |
-| Airflow | APScheduler (runs inside API process) |
-| Qdrant container | SQL cosine similarity (Qdrant optional) |
+Railway deploys each service as a **separate project**. Do this twice —
+once for the API, once for Streamlit.
 
-## Step 1 — Push to GitHub
-```bash
-cd gamesoul
-git init
-git add .
-git commit -m "initial commit"
-gh repo create gamesoul --public --push
+---
+
+## Service 1: API
+
+### In Railway dashboard:
+1. New Project → Deploy from GitHub repo → select `gamesoul`
+2. Railway auto-detects `railway.toml` → uses `Dockerfile.api` ✓
+3. Add **PostgreSQL** plugin: click **New** → **Database** → **PostgreSQL**
+   - Railway auto-sets `DATABASE_URL` ✓
+4. Add environment variables:
+   ```
+   OPENAI_API_KEY=sk-...
+   RAWG_API_KEY=your_rawg_key
+   ```
+5. Deploy — Railway gives you a URL like:
+   `https://gamesoul-api-production.up.railway.app`
+
+### Seed the database (run once after first deploy):
+Visit this URL in your browser:
 ```
-
-## Step 2 — Deploy on Railway
-1. Go to railway.app → New Project → Deploy from GitHub repo
-2. Select your `gamesoul` repo
-3. Railway will detect the `docker-compose.yml`
-
-## Step 3 — Add PostgreSQL
-In Railway dashboard: **New** → **Database** → **PostgreSQL**
-Railway auto-sets `DATABASE_URL` in your services.
-
-## Step 4 — Set environment variables
-In Railway dashboard for the **api** service, add:
-```
-OPENAI_API_KEY=sk-...
-RAWG_API_KEY=your_key
+https://YOUR-API-URL.railway.app/admin/ingest?limit=5000
 ```
 
-For the **streamlit** service, add:
-```
-API_BASE_URL=https://your-api-service.railway.app
-```
+---
 
-## Step 5 — Seed the database
-Once deployed, visit:
-```
-https://your-api.railway.app/admin/ingest?limit=5000
-```
-This triggers background ingestion + emotion extraction.
-Watch progress at:
-```
-https://your-api.railway.app/health
-```
+## Service 2: Streamlit
 
-## Step 6 — Open the app
-```
-https://your-streamlit.railway.app
-```
+1. New Project → Deploy from GitHub repo → select `gamesoul` again
+2. **Override** the Dockerfile in Railway settings:
+   - Settings → Build → Dockerfile Path → type: `Dockerfile.streamlit`
+3. Add environment variable:
+   ```
+   API_BASE_URL=https://YOUR-API-URL.railway.app
+   ```
+4. Deploy → Railway gives you:
+   `https://gamesoul-streamlit-production.up.railway.app`
 
-## Estimated monthly cost on Railway
-| Service | Cost |
-|---------|------|
-| API (512MB) | ~$5/mo |
-| Streamlit (256MB) | ~$3/mo |
-| PostgreSQL | ~$5/mo |
-| OpenAI (5000 games, one-time) | ~$0.50 |
-| **Total** | **~$13/mo** |
+---
+
+## Done!
+Open your Streamlit URL and the app is live.

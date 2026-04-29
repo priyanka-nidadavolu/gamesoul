@@ -434,7 +434,10 @@ async def rate(req: RatingRequest, request: Request):
 
 @app.get("/games/search")
 async def search(q: str, limit: int = 10, request: Request = None):
-    rows = await request.app.state.db.fetch(
+    db = request.app.state.db
+    if not db:
+        raise HTTPException(503, "Database not ready yet — please retry in a few seconds")
+    rows = await db.fetch(
         "SELECT id, name, cover_url FROM games WHERE name ILIKE $1 LIMIT $2", f"%{q}%", limit
     )
     return [dict(r) for r in rows]
@@ -451,7 +454,7 @@ async def trigger_ingest(limit: int = 1000, request: Request = None):
 async def _run_ingest(db, limit: int):
     """Pull games from RAWG and extract emotions — runs in background."""
     import httpx
-    from extraction.index_games import index_games
+    from index_games import index_games
     logger.info(f"Background ingest started: {limit} games")
     # This calls the existing ingest + index pipeline
     try:
@@ -475,9 +478,10 @@ async def _run_ingest(db, limit: int):
 
 
 @app.get("/health")
-async def health():
+async def health(request: Request):
     """Instant response — no DB call so Railway healthcheck never times out."""
-    return {"status": "ok", "version": "2.0.0"}
+    db_ready = request.app.state.db is not None
+    return {"status": "ok", "version": "2.0.0", "db_ready": db_ready}
 
 @app.get("/")
 async def root():

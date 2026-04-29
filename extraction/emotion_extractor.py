@@ -187,6 +187,10 @@ class EmotionExtractor:
             content = resp.json()["message"]["content"]
             return self._parse(content)
 
+    # Backward-compatible alias used by existing tests/callers.
+    def _parse_response(self, content: str) -> EmotionVector:
+        return self._parse(content)
+
     def _parse(self, content: str) -> EmotionVector:
         content = re.sub(r"```(?:json)?", "", content).strip()
         try:

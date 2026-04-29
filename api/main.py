@@ -90,10 +90,15 @@ async def job_data_quality(db):
     if not db:
         return
     count = await db.fetchval(
-        """UPDATE games SET needs_review=TRUE
-           WHERE extraction_confidence < 0.5 AND extraction_confidence IS NOT NULL
-             AND needs_review=FALSE
-           RETURNING COUNT(*)"""
+        """WITH updated AS (
+               UPDATE games
+               SET needs_review=TRUE
+               WHERE extraction_confidence < 0.5
+                 AND extraction_confidence IS NOT NULL
+                 AND needs_review=FALSE
+               RETURNING 1
+           )
+           SELECT COUNT(*) FROM updated"""
     )
     logger.info(f"Data quality: flagged {count or 0} games for review")
     await _record_job(db, "data_quality_check", "success")
@@ -454,22 +459,51 @@ async def trigger_ingest(limit: int = 1000, request: Request = None):
 async def _run_ingest(db, limit: int):
     """Pull games from RAWG and extract emotions — runs in background."""
     logger.info(f"Background ingest started: {limit} games")
-    # This calls the existing ingest + index pipeline
+    if not db:
+        logger.error("Ingest failed: database not ready")
+        return
+
+    # Reuse the existing asyncpg pool connection in Railway.
     try:
-        import sys, os
+        import sys
         sys.path.insert(0, "/app")
-        from ingest import fetch_rawg_games, upsert_games
-        import psycopg2
-        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
-        batch = []
-        for game in fetch_rawg_games(limit):
-            batch.append(game)
-            if len(batch) >= 100:
-                upsert_games(batch, conn)
-                batch = []
-        if batch:
-            upsert_games(batch, conn)
-        conn.close()
+        from ingest import fetch_rawg_games
+
+        insert_sql = """
+            INSERT INTO games (
+                rawg_id, igdb_id, name, slug, description, release_date, rating,
+                ratings_count, genres, platforms, is_multiplayer, cover_url
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                $8, $9::text[], $10::text[], $11, $12
+            )
+            ON CONFLICT (rawg_id) DO UPDATE SET
+                name = EXCLUDED.name,
+                rating = EXCLUDED.rating,
+                ratings_count = EXCLUDED.ratings_count,
+                updated_at = NOW()
+        """
+
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                for game in fetch_rawg_games(limit):
+                    await conn.execute(
+                        insert_sql,
+                        game.get("rawg_id"),
+                        game.get("igdb_id"),
+                        game.get("name", ""),
+                        game.get("slug", ""),
+                        game.get("description", ""),
+                        game.get("release_date"),
+                        game.get("rating"),
+                        game.get("ratings_count", 0),
+                        game.get("genres", []),
+                        game.get("platforms", []),
+                        game.get("is_multiplayer", False),
+                        game.get("cover_url"),
+                    )
+
         logger.info(f"Ingest complete: {limit} games")
     except Exception as e:
         logger.error(f"Ingest failed: {e}")

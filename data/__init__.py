@@ -1,0 +1,2 @@
+"""GameSoul data ingestion package."""
+

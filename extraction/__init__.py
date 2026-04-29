@@ -1,0 +1,2 @@
+"""GameSoul emotion extraction package."""
+

@@ -1,0 +1,2 @@
+"""GameSoul API package."""
+

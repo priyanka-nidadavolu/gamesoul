@@ -5,11 +5,11 @@ WORKDIR /app
 COPY api/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY extraction/emotion_extractor.py .
-COPY extraction/index_games.py .
-COPY bandit/bandit.py bandit.py
-COPY data/ingest.py ingest.py
-COPY api/ .
+COPY api/ ./api/
+COPY extraction/ ./extraction/
+COPY bandit/ ./bandit/
+COPY data/ ./data/
 
 EXPOSE 8000
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+# Use shell form so ${PORT} expansion works.
+CMD uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000}

@@ -25,7 +25,7 @@ Optional: seed a few demo rows in `games` for first recommendation tests.
 
 1. Push this repository to GitHub.
 2. In Render, create a **New Blueprint** and select this repo.
-3. Render will read `render.yaml` and create `gamesoul-api` + `gamesoul-streamlit`.
+3. Render will read `render.yaml` and create `gamesoul-api` + `gamesoul-streamlit` using the repo's Dockerfiles.
 4. Set env vars on `gamesoul-api`:
    - `DATABASE_URL` = Neon connection string
    - `OPENAI_API_KEY` = your key (optional, but recommended for text mode)

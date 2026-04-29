@@ -1,0 +1,2 @@
+"""GameSoul bandit package."""
+

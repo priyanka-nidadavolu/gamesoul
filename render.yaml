@@ -4,10 +4,14 @@ services:
     env: python
     plan: free
     rootDir: .
-    buildCommand: pip install --upgrade pip && pip install -r api/requirements.txt
+    # Force a Python version with available wheels, and install deps wheel-only
+    # to avoid building SciPy/Pandas from source on Render free tiers.
+    buildCommand: pip install --upgrade pip && pip install --only-binary=:all: -r api/requirements.txt
     startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
       - key: DATABASE_URL
         sync: false
       - key: OPENAI_API_KEY
@@ -22,8 +26,10 @@ services:
     env: python
     plan: free
     rootDir: .
-    buildCommand: pip install --upgrade pip && pip install -r streamlit_app/requirements.txt
+    buildCommand: pip install --upgrade pip && pip install --only-binary=:all: -r streamlit_app/requirements.txt
     startCommand: streamlit run streamlit_app/app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
       - key: API_BASE_URL
         sync: false

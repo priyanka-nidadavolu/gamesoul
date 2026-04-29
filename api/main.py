@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import uuid
+from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
@@ -23,14 +24,31 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from emotion_extractor import EmotionExtractor, EmotionVector, DIMENSIONS
-from bandit import ThompsonBandit
+from extraction.emotion_extractor import EmotionExtractor, EmotionVector, DIMENSIONS
+from bandit.bandit import ThompsonBandit
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # ── Config ─────────────────────────────────────────────────────────────────
-DB_URL = os.getenv("DATABASE_URL", "postgresql://gamesoul:gamesoul@localhost:5432/gamesoul")
+def _build_db_url() -> str:
+    """Resolve DB URL with Railway-friendly fallbacks."""
+    direct = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL")
+    if direct:
+        return direct
+
+    pg_host = os.getenv("PGHOST")
+    if pg_host:
+        pg_user = os.getenv("PGUSER", "postgres")
+        pg_pass = os.getenv("PGPASSWORD", "")
+        pg_port = os.getenv("PGPORT", "5432")
+        pg_db = os.getenv("PGDATABASE", "postgres")
+        return f"postgresql://{pg_user}:{pg_pass}@{pg_host}:{pg_port}/{pg_db}"
+
+    return "postgresql://gamesoul:gamesoul@localhost:5432/gamesoul"
+
+
+DB_URL = _build_db_url()
 QDRANT_URL = os.getenv("QDRANT_URL", "")       # optional — falls back to DB search if empty
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 COLLECTION = "game_emotions"
@@ -159,7 +177,9 @@ async def lifespan(app: FastAPI):
     app.state.scheduler = None
 
     async def _connect_db():
-        for attempt in range(5):
+        parsed = urlparse(DB_URL)
+        logger.info(f"Attempting DB connect host={parsed.hostname} port={parsed.port}")
+        for attempt in range(8):
             try:
                 pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=10, timeout=10)
                 rows = await pool.fetch(
@@ -170,8 +190,8 @@ async def lifespan(app: FastAPI):
                 logger.info("DB connected")
                 return
             except Exception as e:
-                logger.warning(f"DB connection attempt {attempt+1}/5 failed: {e}")
-                await asyncio.sleep(3)
+                logger.warning(f"DB connection attempt {attempt+1}/8 failed: {e}")
+                await asyncio.sleep(4)
 
     # Connect in background so /health responds immediately during startup
     asyncio.create_task(_connect_db())
@@ -465,9 +485,7 @@ async def _run_ingest(db, limit: int):
 
     # Reuse the existing asyncpg pool connection in Railway.
     try:
-        import sys
-        sys.path.insert(0, "/app")
-        from ingest import fetch_rawg_games
+        from data.ingest import fetch_rawg_games
 
         insert_sql = """
             INSERT INTO games (

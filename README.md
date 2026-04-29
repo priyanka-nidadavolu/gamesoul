@@ -166,6 +166,10 @@ pip install pytest numpy scipy
 pytest tests/ -v
 ```
 
+## Free Deploy
+
+For a free hosted setup (Render + Neon), see `DEPLOY_FREE.md`.
+
 ---
 
 ## Repository Structure

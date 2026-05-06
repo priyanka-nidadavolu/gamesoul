@@ -5,8 +5,8 @@
 
 CREATE TABLE IF NOT EXISTS games (
     id              SERIAL PRIMARY KEY,
-    rawg_id         INTEGER UNIQUE,
-    igdb_id         INTEGER UNIQUE,
+    rawg_id         INTEGER,
+    igdb_id         INTEGER,
     name            TEXT NOT NULL,
     slug            TEXT,
     description     TEXT,
@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS games (
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_games_rawg_id   ON games(rawg_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_games_rawg_id ON games(rawg_id) WHERE rawg_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_games_igdb_id ON games(igdb_id) WHERE igdb_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_games_slug      ON games(slug);
 CREATE INDEX IF NOT EXISTS idx_games_needs_review ON games(needs_review) WHERE needs_review = TRUE;
 
